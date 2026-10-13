@@ -1,0 +1,12 @@
+# Arduino IDE temporary build folders
+/build/
+/bin/
+
+# Local IDE configuration profiles
+.build/
+.arduino/
+.local_config.h
+
+# OS generated files
+.DS_Store
+Thumbs.db
