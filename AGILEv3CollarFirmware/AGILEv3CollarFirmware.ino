@@ -147,7 +147,7 @@ static const uint8_t BACK_IDX[4] = {1, 2, 3, 4};        // chain index of each b
 // Where each back LED sits around the board, as an angle in the IMU's X/Y frame
 // (0 = +X, 90 = +Y). Placeholder -- set these to match the layout.
 static const float   BACK_ANGLE_DEG[4] = {0, 90, 180, 270};
-static const uint8_t VIZ_MAX_BRIGHT = 80;               // 0-255 cap for the back LEDs
+static const uint8_t VIZ_MAX_BRIGHT = 255;               // 0-255 cap for the back LEDs
 
 // Minimal WS2812 driver on the core's RMT API (same method names as Adafruit_NeoPixel
 // so the rest of the sketch is unchanged). 10 MHz tick: 1 = 800/400 ns, 0 = 400/800 ns.
@@ -1801,7 +1801,7 @@ static void runAll() {
   testFFCStatic();
   testLED();
   Serial.printf("\n========== %d passed, %d failed ==========\n", gPass, gFail);
-  if (gFail) ledSet(20, 0, 0); else ledSet(0, 20, 0);
+  if (gFail) ledSet(255, 0, 0); else ledSet(0, 255, 0);
 }
 
 void setup() {
