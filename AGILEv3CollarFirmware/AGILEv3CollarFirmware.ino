@@ -12,9 +12,10 @@
    -- no separate install, so no repeat of the RMT/NeoPixel conflict).
 
    On boot it latches KEEP_ON, runs all non-destructive tests, prints a report,
-   and leaves the front LED (D2) dim GREEN (all pass) or dim RED (any fail) so
-   you can also run it untethered on battery. The four back LEDs then show a
-   live IMU visualisation (see VIZ section).
+   and shows the result on the front LED (D2) as GREEN (all pass) or RED (any fail)
+   for STATUS_RESULT_HOLD_MS so you can also run it untethered on battery. After that
+   the front LED is a recording indicator: BLUE when idle, blinking RED while recording.
+   The four back LEDs default to a battery gauge (see BATTERY GAUGE in the VIZ section).
 
    Host link (USB-C CDC serial, and a control-only subset over BLE): a small
    binary protocol shares the same USB serial connection as the interactive
@@ -74,7 +75,7 @@
      g  toggle FFC IO0/IO1 in antiphase for 5 s (scope them)
      b  BOOT test point (short TP1 to GND)
      k  release KEEP_ON (board should power off once the magnet is removed)
-     m  cycle back-LED visualisation mode (off / tilt / spin)
+     m  cycle back-LED mode (off / tilt / spin / battery)
      c  re-calibrate gyro bias (hold the board still)
      p  print log / time-sync / BLE status
      x  MMC5633 continuous-mode check vs manual SET/RESET (hold the board still)
@@ -142,12 +143,30 @@ static inline uint64_t nowUs() {
 // ---------------------------------------------------------------- LED chain
 // D2 (front) DOUT -> LEDO -> four back-side WS2812s.
 static const int     NUM_LEDS  = 5;
-static const int     FRONT_LED = 0;                     // D2: test status
+static const int     FRONT_LED = 0;                     // D2: test status / recording indicator
 static const uint8_t BACK_IDX[4] = {1, 2, 3, 4};        // chain index of each back LED
 // Where each back LED sits around the board, as an angle in the IMU's X/Y frame
 // (0 = +X, 90 = +Y). Placeholder -- set these to match the layout.
 static const float   BACK_ANGLE_DEG[4] = {0, 90, 180, 270};
-static const uint8_t VIZ_MAX_BRIGHT = 255;               // 0-255 cap for the back LEDs
+static const uint8_t VIZ_MAX_BRIGHT = 255;               // 0-255 cap for the back LEDs (also used by the battery gauge)
+
+// ---- Front LED (D2) status indicator ----
+// Idle = solid blue, recording = blinking red. The boot self-test result (green/red) is
+// shown for STATUS_RESULT_HOLD_MS after runAll() before the indicator takes over
+// (set to 0 to skip it). The hold is ignored while recording.
+static const uint8_t  STATUS_LED_BRIGHT     = 60;       // 0-255, raw (no gamma) for the front LED
+static const uint32_t REC_BLINK_PERIOD_MS   = 1000;     // full on+off cycle; on for the first half
+static const uint32_t STATUS_RESULT_HOLD_MS = 3000;
+static uint32_t       gStatusHoldUntilMs    = 0;
+
+// ---- Battery gauge on the back LEDs ----
+// Pack voltage (from the +BATT divider) is mapped linearly from BATT_EMPTY_V (0 %) to
+// BATT_FULL_V (100 %). The number of lit back LEDs is ceil(fraction * 4), never below 1, and
+// all lit LEDs share one colour that runs green (full) -> yellow (half) -> red (empty).
+// ASSUMES a single-cell LiPo; adjust the two voltages for your cell / cut-off.
+static const float    BATT_FULL_V    = 4.10f;
+static const float    BATT_EMPTY_V   = 3.30f;
+static const uint32_t BATT_SAMPLE_MS = 1000;            // ADC sample + gauge refresh period
 
 // Minimal WS2812 driver on the core's RMT API (same method names as Adafruit_NeoPixel
 // so the rest of the sketch is unchanged). 10 MHz tick: 1 = 800/400 ns, 0 = 400/800 ns.
@@ -186,7 +205,13 @@ class LedStrip {
         }
       }
       rmtWrite(pin_, sym_, k, RMT_WAIT_FOR_EVER);
+      memcpy(shown_, px_, sizeof(shown_));            // remember what is on the LEDs now
       delayMicroseconds(300);                         // latch (WS2812C-2020 needs >280 us)
+    }
+    // Only pushes to the LEDs if some pixel differs from what was last shown, so callers
+    // can refresh every loop pass without hammering the RMT peripheral.
+    void showIfChanged() {
+      if (memcmp(px_, shown_, sizeof(px_)) != 0) show();
     }
     // hue 0..65535 (0 = red, 21845 = green, 43690 = blue), like Adafruit's ColorHSV
     static uint32_t ColorHSV(uint16_t hue, uint8_t sat, uint8_t val) {
@@ -216,6 +241,7 @@ class LedStrip {
     int pin_;
     bool ok_ = false;
     uint32_t px_[NUM_LEDS] = {0};
+    uint32_t shown_[NUM_LEDS] = {0};
     rmt_data_t sym_[NUM_LEDS * 24];
 };
 
@@ -1625,14 +1651,33 @@ static void testKeepOn() {
   Serial.println("Still alive -> magnet still near U1, Q2 bypassed, or Q1/Q2 not releasing. KEEP_ON re-asserted.");
 }
 
+// ---------------------------------------------------------------- Front LED: recording indicator
+// Blue when idle, blinking red while a recording is active (activeFile >= 0). Cheap enough to
+// call every loop pass: it only touches the LEDs when the colour actually changes.
+static void statusLedTick() {
+  uint32_t now = millis();
+  // Keep the boot self-test colour (green/red) on screen briefly, unless recording has begun.
+  if (activeFile < 0 && (int32_t)(now - gStatusHoldUntilMs) < 0) return;
+  uint32_t c;
+  if (activeFile >= 0) {
+    bool on = (now % REC_BLINK_PERIOD_MS) < (REC_BLINK_PERIOD_MS / 2);
+    c = on ? strip.Color(STATUS_LED_BRIGHT, 0, 0) : 0;
+  } else {
+    c = strip.Color(0, 0, STATUS_LED_BRIGHT);
+  }
+  strip.setPixelColor(FRONT_LED, c);
+  strip.showIfChanged();
+}
+
 // ---------------------------------------------------------------- VIZ: IMU on the back LEDs
 // TILT: light pools on the downhill side like liquid in a level.
 // SPIN: a comet circles the ring, following integrated yaw (gyro Z).
 // Both: colour tracks rotation rate (blue = still -> red = ~720 dps),
 //       and a jolt (|a| far from 1 g) flashes the ring white.
-enum VizMode : uint8_t { VIZ_OFF, VIZ_TILT, VIZ_SPIN, VIZ_COUNT };
-static const char *VIZ_NAMES[VIZ_COUNT] = {"off", "tilt", "spin"};
-static uint8_t  vizMode = VIZ_TILT;
+// BATT: battery gauge (see BATTERY GAUGE below). This is the default mode.
+enum VizMode : uint8_t { VIZ_OFF, VIZ_TILT, VIZ_SPIN, VIZ_BATT, VIZ_COUNT };
+static const char *VIZ_NAMES[VIZ_COUNT] = {"off", "tilt", "spin", "battery"};
+static uint8_t  vizMode = VIZ_BATT;
 static float    gyroBias[3] = {0, 0, 0};
 static float    lpAcc[3] = {0, 0, 1};
 static float    yawDeg = 0, jolt = 0;
@@ -1660,8 +1705,46 @@ static void vizClear() {
   strip.show();
 }
 
+// ---- BATTERY GAUGE ----
+// Samples the divider every BATT_SAMPLE_MS, low-pass filters it (recording current causes
+// sag and the ADC is noisy), and maps it to 1..4 lit LEDs with a little hysteresis so a
+// voltage sitting on a boundary doesn't flicker. All lit LEDs share one colour that runs
+// green (full) -> yellow -> red (empty).
+static float    battFiltV = 0;                      // 0 = no sample yet
+static int      battLeds = -1;                      // -1 = not decided yet
+static uint32_t battLastMs = 0;
+
+static void battUpdate() {
+  uint32_t now = millis();
+  if (battFiltV > 0 && now - battLastMs < BATT_SAMPLE_MS) return;
+  battLastMs = now;
+
+  float v = readVbatt(16);
+  battFiltV = (battFiltV > 0) ? battFiltV + 0.2f * (v - battFiltV) : v;
+
+  float frac = constrain((battFiltV - BATT_EMPTY_V) / (BATT_FULL_V - BATT_EMPTY_V), 0.0f, 1.0f);
+  float lvl = frac * 4.0f;                          // 0..4 "LEDs worth" of charge
+  if (battLeds < 0) {
+    battLeds = max(1, (int)ceilf(lvl));
+  } else if (lvl > battLeds + 0.1f) {               // must clear the boundary by 0.1 LED to step up
+    battLeds = min(4, (int)ceilf(lvl));
+  } else if (lvl < battLeds - 1 - 0.1f) {           // ...and to step down
+    battLeds = max(1, (int)ceilf(lvl));
+  }
+
+  uint16_t hue = (uint16_t)(21845.0f * frac);       // 21845 = green (full) ... 10922 = yellow ... 0 = red (empty)
+  uint32_t col = strip.ColorHSV(hue, 255, VIZ_MAX_BRIGHT);
+  for (int k = 0; k < 4; k++) strip.setPixelColor(BACK_IDX[k], k < battLeds ? col : 0);
+  strip.showIfChanged();
+}
+
 static void vizUpdate() {
-  if (vizMode == VIZ_OFF || !lsmAddr) return;
+  if (vizMode == VIZ_OFF) return;
+  if (vizMode == VIZ_BATT) {
+    battUpdate();
+    return;
+  }
+  if (!lsmAddr) return;
   uint32_t now = millis();
   if (now - vizLastMs < 20) return;                   // ~50 Hz
   float dt = fminf((now - vizLastMs) / 1000.0f, 0.1f);
@@ -1698,7 +1781,7 @@ static void vizUpdate() {
     }
     lvl = fmaxf(lvl, jolt);
     uint8_t val = (uint8_t)(lvl * VIZ_MAX_BRIGHT);
-    strip.setPixelColor(BACK_IDX[k], strip.gamma32(strip.ColorHSV(hue, sat, val)));
+    strip.setPixelColor(BACK_IDX[k], strip.ColorHSV(hue, sat, val));
   }
   strip.show();
 }
@@ -1708,6 +1791,7 @@ static void vizNextMode() {
   Serial.printf("Back-LED mode: %s\n", VIZ_NAMES[vizMode]);
   if (vizMode == VIZ_OFF) vizClear();
   if (vizMode == VIZ_SPIN) vizCalibrate();
+  if (vizMode == VIZ_BATT) battLastMs = millis() - BATT_SAMPLE_MS;   // redraw the gauge on the next pass
 }
 
 // ---------------------------------------------------------------- Streaming
@@ -1724,6 +1808,7 @@ static void streamSensors() {
                   a[0], a[1], a[2], g[0], g[1], g[2], p / 100.0f, bt, B[0], B[1], B[2], readVbatt());
     for (int i = 0; i < 6; i++) {
       vizUpdate();
+      statusLedTick();
       delay(10);
     }
   }
@@ -1802,6 +1887,7 @@ static void runAll() {
   testLED();
   Serial.printf("\n========== %d passed, %d failed ==========\n", gPass, gFail);
   if (gFail) ledSet(255, 0, 0); else ledSet(0, 255, 0);
+  gStatusHoldUntilMs = millis() + STATUS_RESULT_HOLD_MS;   // show the result briefly, then statusLedTick() takes over
 }
 
 void setup() {
@@ -1834,6 +1920,7 @@ void setup() {
 void loop() {
   bleProcessQueue();                              // BLE commands first: keeps TIME_PING latency low
   vizUpdate();
+  statusLedTick();
   logTick();
   bleStatusTick();
   bool gotFrameByte = false;
