@@ -14,8 +14,8 @@
    On boot it latches KEEP_ON, runs all non-destructive tests, prints a report,
    and shows the result on the front LED (D2) as GREEN (all pass) or RED (any fail)
    for STATUS_RESULT_HOLD_MS so you can also run it untethered on battery. After that
-   the front LED is a recording indicator: BLUE when idle, blinking RED while recording.
-   The four back LEDs default to a battery gauge (see BATTERY GAUGE in the VIZ section).
+   the front LED is BLUE when idle, and while recording ALL FIVE LEDs flash RED together.
+   When not recording the four back LEDs default to a battery gauge (see BATTERY GAUGE in the VIZ section).
 
    Host link (USB-C CDC serial, and a control-only subset over BLE): a small
    binary protocol shares the same USB serial connection as the interactive
@@ -30,7 +30,7 @@
    2048-byte NAND page per call; USB only, BLE replies ERR_TOO_BIG_FOR_TRANSPORT),
    0x06 DELETE (payload: fileId), 0x07 STATUS, 0x08 POWER_OFF, 0x09 TIME_PING,
    0x0A SET_TIME_US. See the NAND FILE LOG and HOST PROTOCOL sections for
-   exact reply payloads. Data is logged at LOG_RATE_HZ into 28-byte
+   exact reply payloads. Data is logged at LOG_RATE_HZ into 34-byte
    SampleRecord entries; see that struct for field scaling.
 
    Time sync (microsecond class): every board timestamp comes from esp_timer
@@ -57,7 +57,8 @@
    mode at 50 Hz with automatic SET/RESET, so each refresh picks up a result that is at most
    ~20-30 ms old and the loop never blocks on a magnetometer measurement.
 
-   BLE: advertises as "SmartToy-XXXX" (XXXX = last 2 MAC bytes), Nordic-UART-
+   BLE: advertises as BLE_DEVICE_NAME (set per device; if empty, "SmartToy-XXXX"
+   with XXXX = last 2 MAC bytes), Nordic-UART-
    style GATT service, Just Works bonding (no PIN). Meant for commands and
    status only -- bulk file transfer stays on USB-C. Commands received over
    BLE are queued and executed from loop() so they never touch the NAND / I2C /
@@ -105,9 +106,10 @@ struct SampleRecord {
   uint32_t t_ms;                     // ms since this recording started (t_ms == 0 <-> file startEpochUs)
   int16_t  ax_mg, ay_mg, az_mg;      // milli-g
   int16_t  gx_dps10, gy_dps10, gz_dps10;  // deci-dps (actual dps = value / 10)
-  int32_t  press_pa;                 // Pa, refreshed every MAG_BARO_REFRESH_DIV samples, carried forward otherwise
+  int32_t  press_q6;                 // pressure in 1/64 Pa (= the BMP581's own LSB; Pa = value / 64). Refreshed every
+                                     //   MAG_BARO_REFRESH_DIV samples, carried forward otherwise
   int16_t  temp_cdeg;                // BMP temp x100 C, carried forward
-  int16_t  mx_dt, my_dt, mz_dt;      // deci-uT, carried forward
+  int32_t  mx_cnt, my_cnt, mz_cnt;   // MMC5633 counts, null-subtracted (1 LSB = 1/16384 G = 0.006104 uT), carried forward
 };
 #pragma pack(pop)
 
@@ -151,10 +153,12 @@ static const float   BACK_ANGLE_DEG[4] = {0, 90, 180, 270};
 static const uint8_t VIZ_MAX_BRIGHT = 255;               // 0-255 cap for the back LEDs (also used by the battery gauge)
 
 // ---- Front LED (D2) status indicator ----
-// Idle = solid blue, recording = blinking red. The boot self-test result (green/red) is
-// shown for STATUS_RESULT_HOLD_MS after runAll() before the indicator takes over
-// (set to 0 to skip it). The hold is ignored while recording.
-static const uint8_t  STATUS_LED_BRIGHT     = 60;       // 0-255, raw (no gamma) for the front LED
+// Idle = solid blue on the front LED. Recording = all five LEDs (front + the four back ones)
+// flash red together, which takes over the back-LED gauge until the recording stops.
+// The boot self-test result (green/red) is shown for STATUS_RESULT_HOLD_MS after runAll()
+// before the indicator takes over (set to 0 to skip it). The hold is ignored while recording.
+static const uint8_t  STATUS_LED_BRIGHT     = 60;       // 0-255, raw (no gamma): the idle blue front LED
+static const uint8_t  REC_FLASH_BRIGHT      = 255;      // 0-255, raw (no gamma): red on all five LEDs while recording
 static const uint32_t REC_BLINK_PERIOD_MS   = 1000;     // full on+off cycle; on for the first half
 static const uint32_t STATUS_RESULT_HOLD_MS = 3000;
 static uint32_t       gStatusHoldUntilMs    = 0;
@@ -352,7 +356,7 @@ static bool lsmInit() {
   if (!lsmAddr) return false;
   i2cWrite(lsmAddr, 0x12, 0x01); delay(20);       // CTRL3_C: SW_RESET
   i2cWrite(lsmAddr, 0x12, 0x44);                  // CTRL3_C: BDU | IF_INC
-  i2cWrite(lsmAddr, 0x10, 0x40);                  // CTRL1_XL: 104 Hz, +-2 g
+  i2cWrite(lsmAddr, 0x10, 0x4C);                  // CTRL1_XL: 104 Hz, +-8 g
   i2cWrite(lsmAddr, 0x11, 0x4C);                  // CTRL2_G: 104 Hz, 2000 dps
   delay(100);
   return true;
@@ -366,7 +370,7 @@ static bool lsmRead(float a[3], float g[3], float &t) {
   t = 25.0f + r[0] / (lsmWho == 0x69 ? 16.0f : 256.0f);
   for (int i = 0; i < 3; i++) {
     g[i] = r[1 + i] * 0.070f;      // 70 mdps/LSB @ 2000 dps
-    a[i] = r[4 + i] * 0.000061f;   // 0.061 mg/LSB @ 2 g
+    a[i] = r[4 + i] * 0.000244f;   // 0.244 mg/LSB @ 8 g
   }
   return true;
 }
@@ -730,9 +734,9 @@ struct DirHeader {
 };
 #pragma pack(pop)
 
-static_assert(sizeof(SampleRecord) == 28, "record size drifted");
+static_assert(sizeof(SampleRecord) == 34, "record size drifted");
 static_assert(sizeof(DirHeader) + sizeof(DirImage) <= PAGE_SIZE, "directory no longer fits one page");
-// 72 records = 2016 bytes per NAND page. The 8-byte GET_PAGE reply header plus this must
+// 60 records = 2040 bytes per NAND page. The 8-byte GET_PAGE reply header plus this must
 // stay <= 2048 (the app's max frame payload), and a page always holds whole records.
 static const uint32_t RECORDS_PER_PAGE = (PAGE_SIZE - 8) / sizeof(SampleRecord);
 static const uint32_t DIR_MAGIC = 0x53544C47;    // 'STLG' (inside the DirImage; also the whole-page magic of older firmware)
@@ -1144,11 +1148,12 @@ static void logTick() {
   rec.gx_dps10 = (int16_t)lroundf(g[0] * 10.0f);
   rec.gy_dps10 = (int16_t)lroundf(g[1] * 10.0f);
   rec.gz_dps10 = (int16_t)lroundf(g[2] * 10.0f);
-  rec.press_pa = (int32_t)lroundf(lastPressPa);
+  rec.press_q6 = (int32_t)lroundf(lastPressPa * 64.0f);   // exact: pPa is a multiple of 1/64 Pa and fits a float
   rec.temp_cdeg = (int16_t)lroundf(lastTempC * 100.0f);
-  rec.mx_dt = (int16_t)lroundf(lastMagUT[0] * 10.0f);
-  rec.my_dt = (int16_t)lroundf(lastMagUT[1] * 10.0f);
-  rec.mz_dt = (int16_t)lroundf(lastMagUT[2] * 10.0f);
+  const float UT_TO_CNT = 16384.0f / 100.0f;         // inverse of the counts -> G -> uT conversion in mmcContRead()
+  rec.mx_cnt = (int32_t)lroundf(lastMagUT[0] * UT_TO_CNT);
+  rec.my_cnt = (int32_t)lroundf(lastMagUT[1] * UT_TO_CNT);
+  rec.mz_cnt = (int32_t)lroundf(lastMagUT[2] * UT_TO_CNT);
   logAppend(rec);
 }
 
@@ -1448,6 +1453,11 @@ static const char *BLE_SVC_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 static const char *BLE_RX_UUID  = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";  // write:  host -> board
 static const char *BLE_TX_UUID  = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";  // notify: board -> host
 
+// Name this board advertises over BLE; it is what the phone app lists in its device drop-down.
+// Set a unique one for each device before flashing. Leave it empty ("") to fall back to
+// "SmartToy-XXXX" (last 2 MAC bytes). Keep it under ~29 characters.
+static const char *BLE_DEVICE_NAME = "Collar-01";
+
 // BLE callbacks run on the Bluetooth stack's task, not the Arduino loop() task. To keep NAND,
 // I2C and the directory single-threaded, RxCB only validates the frame and queues it;
 // bleProcessQueue() (called first thing in loop()) executes it. The request's arrival time is
@@ -1507,9 +1517,13 @@ static void bleProcessQueue() {
 }
 
 static void bleSetup() {
-  char name[24];
-  uint64_t mac = ESP.getEfuseMac();
-  snprintf(name, sizeof(name), "SmartToy-%04X", (unsigned)(mac & 0xFFFF));
+  char name[32];
+  if (BLE_DEVICE_NAME[0]) {
+    snprintf(name, sizeof(name), "%s", BLE_DEVICE_NAME);
+  } else {
+    uint64_t mac = ESP.getEfuseMac();
+    snprintf(name, sizeof(name), "SmartToy-%04X", (unsigned)(mac & 0xFFFF));
+  }
   BLEDevice::init(name);
   BLEDevice::setMTU(247);                            // allow a larger ATT MTU if the central asks (replies still go out in 20 B pieces)
   bleCmdQueue = xQueueCreate(8, sizeof(BleCmd));
@@ -1654,18 +1668,24 @@ static void testKeepOn() {
 // ---------------------------------------------------------------- Front LED: recording indicator
 // Blue when idle, blinking red while a recording is active (activeFile >= 0). Cheap enough to
 // call every loop pass: it only touches the LEDs when the colour actually changes.
+static void vizRestoreAfterRecording();             // defined in the VIZ section below
+
 static void statusLedTick() {
+  static bool wasRecording = false;
   uint32_t now = millis();
+  bool rec = activeFile >= 0;
+  if (wasRecording && !rec) vizRestoreAfterRecording();   // give the back LEDs back to the gauge / viz
+  wasRecording = rec;
   // Keep the boot self-test colour (green/red) on screen briefly, unless recording has begun.
-  if (activeFile < 0 && (int32_t)(now - gStatusHoldUntilMs) < 0) return;
-  uint32_t c;
-  if (activeFile >= 0) {
+  if (!rec && (int32_t)(now - gStatusHoldUntilMs) < 0) return;
+  if (rec) {
     bool on = (now % REC_BLINK_PERIOD_MS) < (REC_BLINK_PERIOD_MS / 2);
-    c = on ? strip.Color(STATUS_LED_BRIGHT, 0, 0) : 0;
+    uint32_t c = on ? strip.Color(REC_FLASH_BRIGHT, 0, 0) : 0;
+    strip.setPixelColor(FRONT_LED, c);
+    for (uint8_t idx : BACK_IDX) strip.setPixelColor(idx, c);
   } else {
-    c = strip.Color(0, 0, STATUS_LED_BRIGHT);
+    strip.setPixelColor(FRONT_LED, strip.Color(0, 0, STATUS_LED_BRIGHT));
   }
-  strip.setPixelColor(FRONT_LED, c);
   strip.showIfChanged();
 }
 
@@ -1738,7 +1758,15 @@ static void battUpdate() {
   strip.showIfChanged();
 }
 
+// Called when a recording ends. The red flash had taken over the back LEDs, so put them back:
+// clear them if the viz is off, or force the gauge to redraw (tilt/spin redraw on their own).
+static void vizRestoreAfterRecording() {
+  if (vizMode == VIZ_OFF) vizClear();
+  else battLastMs = millis() - BATT_SAMPLE_MS;
+}
+
 static void vizUpdate() {
+  if (activeFile >= 0) return;                        // the recording flash (statusLedTick) owns all the LEDs
   if (vizMode == VIZ_OFF) return;
   if (vizMode == VIZ_BATT) {
     battUpdate();
